@@ -1,0 +1,20 @@
+{
+  "platform": "DaikinWeb",
+  "name": "Daikin Web",
+  "baseUrl": "http://127.0.0.1:5050",
+  "pollIntervalSec": 60,
+  "maxQueueDepth": 24,
+  "devices": [
+    {
+      "id": "living_room",
+      "name": "Living room",
+      "mac": "AA:BB:CC:DD:EE:01"
+    },
+    {
+      "id": "bedroom",
+      "name": "Bedroom",
+      "mac": "AA:BB:CC:DD:EE:02"
+    }
+  ]
+}
+

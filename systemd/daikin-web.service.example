@@ -1,0 +1,44 @@
+[Unit]
+Description=Daikin Madoka multi-room web controller (BLE -> HTTP)
+After=network-online.target bluetooth.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=daikin
+Group=bluetooth
+WorkingDirectory=/opt/daikin-web
+EnvironmentFile=/etc/daikin-web.env
+ExecStart=/usr/bin/python3 /opt/daikin-web/daikin_web.py
+Restart=on-failure
+RestartSec=5s
+# Logs go to journald (view: journalctl -u daikin-web -f). No manual rotation needed.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=daikin-web
+# Allow in-flight pymadoka subprocesses to finish on shutdown.
+TimeoutStopSec=80s
+
+# --- Hardening ----------------------------------------------------------------
+# Block privilege escalation via setuid binaries spawned by the service.
+NoNewPrivileges=true
+# Service gets its own /tmp; can't see or be seen by other services' temp files.
+PrivateTmp=true
+# Read-only / and /usr; /etc and /var remain writable (journald, etc).
+ProtectSystem=full
+# Kernel surface protections.
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+# Restrict what the process can do.
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+# Bound failure blast radius.
+LimitNOFILE=1024
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

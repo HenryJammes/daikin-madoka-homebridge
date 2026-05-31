@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+node_modules/
+*.log
+*.bak
+*.local
+.env
+daikin-web.env
+config.local.json
+
