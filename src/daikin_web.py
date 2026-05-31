@@ -590,6 +590,27 @@ def run_pymadoka(mac, *args):
                     if proc.returncode == 0:
                         last_error = None
                         output = proc.stdout.strip()
+                        if args[:1] == ("get-status",):
+                            if not output:
+                                last_error = RuntimeError("pymadoka get-status returned empty output")
+                                raise last_error
+                            try:
+                                data = json.loads(output)
+                            except json.JSONDecodeError as exc:
+                                last_error = RuntimeError(
+                                    f"pymadoka get-status returned non-JSON output: {exc}"
+                                )
+                                raise last_error
+                            expected = {
+                                "power_state", "operation_mode", "set_point",
+                                "fan_speed", "temperatures", "clean_filter_indicator",
+                            }
+                            if not isinstance(data, dict) or not (expected & set(data.keys())):
+                                last_error = RuntimeError(
+                                    "pymadoka get-status returned JSON without expected status fields"
+                                )
+                                raise last_error
+                            return data
                         if not output:
                             return {}
                         try:

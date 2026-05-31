@@ -250,8 +250,10 @@ class DaikinAccessory {
       .onGet(() => this.state?.set_point?.cooling_set_point ?? 24)
       .onSet((value) => {
         const v = Math.round(value);
-        const heating = this.state?.set_point?.heating_set_point ?? 20;
-        this.writeAsync("/api/setpoint", { cooling: v, heating }, (s) => {
+        const body = { cooling: v };
+        const heating = this.state?.set_point?.heating_set_point;
+        if (heating !== undefined && heating !== null) body.heating = heating;
+        this.writeAsync("/api/setpoint", body, (s) => {
           s.set_point = { ...(s.set_point || {}), cooling_set_point: v };
         });
       });
@@ -263,8 +265,10 @@ class DaikinAccessory {
       .onGet(() => this.state?.set_point?.heating_set_point ?? 20)
       .onSet((value) => {
         const v = Math.round(value);
-        const cooling = this.state?.set_point?.cooling_set_point ?? 24;
-        this.writeAsync("/api/setpoint", { cooling, heating: v }, (s) => {
+        const body = { heating: v };
+        const cooling = this.state?.set_point?.cooling_set_point;
+        if (cooling !== undefined && cooling !== null) body.cooling = cooling;
+        this.writeAsync("/api/setpoint", body, (s) => {
           s.set_point = { ...(s.set_point || {}), heating_set_point: v };
         });
       });

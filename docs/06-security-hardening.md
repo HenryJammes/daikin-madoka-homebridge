@@ -11,17 +11,21 @@ Do not expose SSH, HomeBridge UI, HomeKit, or `daikin-web` from your router.
 Replace `192.168.1.0/24` with your LAN subnet.
 
 ```bash
+HAP_PORT=$(python3 -c 'import json; print(json.load(open("/var/lib/homebridge/config.json"))["bridge"]["port"])')
+
 sudo ufw default deny incoming
 sudo ufw default allow outgoing
 sudo ufw allow from 192.168.1.0/24 to any port 22 proto tcp comment 'ssh LAN'
 sudo ufw allow from 192.168.1.0/24 to any port 8581 proto tcp comment 'homebridge UI LAN'
-sudo ufw allow 51127/tcp comment 'HomeKit HAP'
+sudo ufw allow "${HAP_PORT}/tcp" comment 'HomeKit HAP'
 sudo ufw allow 5353/udp comment 'mDNS'
 sudo ufw enable
 sudo ufw status numbered
 ```
 
 Do not add a rule for port `5050`. The backend should be reachable only from the Pi itself.
+
+HomeBridge chooses its own HAP port in `config.json`; do not blindly copy `51127` from someone else's setup.
 
 ## 3. SSH
 
@@ -103,4 +107,3 @@ Discoverable: no
 Pairable: no
 Discovering: no
 ```
-

@@ -34,16 +34,17 @@ Reconnect after reboot.
 ```bash
 sudo apt install -y \
   bluetooth bluez python3 python3-venv python3-pip \
-  curl git ufw fail2ban unattended-upgrades
+  ca-certificates curl git gnupg ufw fail2ban unattended-upgrades
 ```
 
 ## 5. Install HomeBridge
 
-Follow the official HomeBridge Raspberry Pi instructions when possible:
+Follow the official HomeBridge Raspberry Pi instructions when possible. This is the current APT-repository pattern:
 
 ```bash
-curl -sSfL https://repo.homebridge.io/KEY.gpg | sudo gpg --dearmor -o /usr/share/keyrings/homebridge.gpg
-echo "deb [signed-by=/usr/share/keyrings/homebridge.gpg] https://repo.homebridge.io stable main" | sudo tee /etc/apt/sources.list.d/homebridge.list
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://repo.homebridge.io/KEY.gpg | sudo gpg --dearmor -o /etc/apt/keyrings/homebridge.gpg
+echo "deb [signed-by=/etc/apt/keyrings/homebridge.gpg] https://repo.homebridge.io stable main" | sudo tee /etc/apt/sources.list.d/homebridge.list
 sudo apt update
 sudo apt install -y homebridge
 ```
@@ -58,14 +59,14 @@ Create an admin user and keep that password safe.
 
 ## 6. Install pymadoka
 
-The exact install command can change depending on the upstream project. The typical pattern is:
+Install `pymadoka` from its upstream GitHub repository:
 
 ```bash
 sudo mkdir -p /opt/pymadoka-venv
 sudo chown "$USER":"$USER" /opt/pymadoka-venv
 python3 -m venv /opt/pymadoka-venv
 /opt/pymadoka-venv/bin/pip install --upgrade pip
-/opt/pymadoka-venv/bin/pip install pymadoka
+/opt/pymadoka-venv/bin/pip install 'git+https://github.com/wmalgadey/pymadoka.git'
 ```
 
 Check it exists:
@@ -73,4 +74,3 @@ Check it exists:
 ```bash
 /opt/pymadoka-venv/bin/pymadoka --help
 ```
-

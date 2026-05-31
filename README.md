@@ -1,6 +1,6 @@
-# Daikin Madoka Bluetooth to Apple Home
+# Daikin Madoka Bluetooth AC to Apple Home
 
-Control Daikin Madoka / BRC1H Bluetooth wall controllers from the Apple Home app, including away from home, using:
+Control Daikin Madoka / BRC1H Bluetooth wall controllers from the Apple Home app, including away from home. The Raspberry Pi acts as a small home-network relay: it talks Bluetooth to the Daikin remotes, and HomeBridge exposes them to Apple Home over Wi-Fi/Ethernet.
 
 ```text
 iPhone Home app
@@ -12,7 +12,7 @@ iPhone Home app
   -> Daikin Madoka controller
 ```
 
-This repository is a field-tested reference implementation for people who have Daikin Bluetooth-only remotes and want Apple Home control without exposing a custom web server to the internet.
+This repository is a field-tested reference implementation for people searching for Daikin Madoka Wi-Fi control, Daikin BRC1H HomeKit control, or a Raspberry Pi relay for Bluetooth-only Daikin AC remotes.
 
 > **Do not port-forward this.** Remote access should happen through Apple HomeKit remote access via an Apple TV or HomePod Home Hub.
 
@@ -22,7 +22,7 @@ Use this if:
 
 - You have one or more Daikin Madoka / BRC1H Bluetooth controllers.
 - You can control them locally over Bluetooth, but you want remote control from your iPhone.
-- You are comfortable buying a Raspberry Pi and following copy/paste terminal instructions.
+- You are comfortable preparing a Raspberry Pi and following copy/paste terminal instructions.
 - You have an Apple TV or HomePod that can act as an Apple Home Hub.
 
 This is not an official Daikin project.
@@ -44,7 +44,7 @@ This is not an official Daikin project.
 ## Start here
 
 1. Read [`docs/01-overview.md`](docs/01-overview.md).
-2. Buy/prepare the hardware in [`docs/02-hardware.md`](docs/02-hardware.md).
+2. Prepare the hardware in [`docs/02-hardware.md`](docs/02-hardware.md).
 3. Install the Pi software using [`docs/03-install-raspberry-pi.md`](docs/03-install-raspberry-pi.md).
 4. Pair your Daikin controllers using [`docs/04-pair-controllers.md`](docs/04-pair-controllers.md).
 5. Install the backend and HomeBridge plugin using [`docs/05-install-daikin-bridge.md`](docs/05-install-daikin-bridge.md).
