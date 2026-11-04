@@ -3,10 +3,11 @@ set -euo pipefail
 
 echo "== services =="
 systemctl is-active daikin-web homebridge fail2ban unattended-upgrades || true
+systemctl show --no-pager daikin-web homebridge -p ActiveEnterTimestamp -p ExecMainStatus -p NRestarts
 
 echo
 echo "== backend health =="
-curl -fsS http://127.0.0.1:5050/healthz
+curl --connect-timeout 3 --max-time 5 -fsS http://127.0.0.1:5050/healthz
 echo
 
 echo

@@ -59,14 +59,16 @@ Create an admin user and keep that password safe.
 
 ## 6. Install pymadoka
 
-Install `pymadoka` from its upstream GitHub repository:
+Install the pinned `pymadoka` CLI release from PyPI. The upstream project is
+[`mduran80/pymadoka`](https://github.com/mduran80/pymadoka); the previously
+documented `wmalgadey/pymadoka` repository is unavailable.
 
 ```bash
 sudo mkdir -p /opt/pymadoka-venv
 sudo chown "$USER":"$USER" /opt/pymadoka-venv
 python3 -m venv /opt/pymadoka-venv
 /opt/pymadoka-venv/bin/pip install --upgrade pip
-/opt/pymadoka-venv/bin/pip install 'git+https://github.com/wmalgadey/pymadoka.git'
+/opt/pymadoka-venv/bin/pip install 'pymadoka==0.2.13'
 ```
 
 Check it exists:
@@ -74,3 +76,7 @@ Check it exists:
 ```bash
 /opt/pymadoka-venv/bin/pymadoka --help
 ```
+
+The help must list `--clean`, `get-status`, and `set-power-state`. Keep a working
+installation pinned while diagnosing a problem; do not upgrade Python, BlueZ,
+and the Bluetooth library together as a troubleshooting shortcut.
