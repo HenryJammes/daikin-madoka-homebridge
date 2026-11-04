@@ -54,12 +54,29 @@ This is not an official Daikin project.
 
 ## Expected behavior
 
-Bluetooth is not instant. A healthy command is often **10-30 seconds**. A remote command over cellular through Apple Home can take longer. The implementation is designed to prefer reliable control over a perfect real-time dashboard:
+Bluetooth is not instant. A healthy simple command is often **10-30 seconds**. A partial temperature change needs a live read before writing both thresholds and can take longer. The implementation is designed to prefer reliable control over a perfect real-time dashboard:
 
 - One Bluetooth operation runs at a time.
 - HomeKit writes get priority over background polling.
 - Failed background status reads should not block turning an AC off.
 - The backend is loopback-only by default.
+- Unsent commands expire after 60 seconds, and a newer power request supersedes an older queued one. OFF gets priority over other queued writes, but cannot undo a command already sent over Bluetooth.
+- Writes are not automatically replayed after a timeout: their outcome may be unknown. The plugin reads back the controller instead.
+- HomeKit setters acknowledge receipt promptly, not physical completion. A failed write surfaces a communication error until a live read succeeds; a last good status is retained for at most five minutes through polling failures.
+- Current temperature is the actual Madoka indoor/return-air reading, not the desired temperature. It can differ from a separate room thermometer.
+
+The CLI supports **16-30 C temperature writes**. HomeKit can display higher readings from the physical controller, but the bridge rejects requests that would be silently clamped by `pymadoka`. See the [temperature limitations and upgrade notes](docs/08-troubleshooting.md#temperature-readings-and-limits).
+
+For Sauter Cozytouch and Ecoso radiators alongside Daikin, see [adding other heaters to Apple Home](docs/07-apple-home-remote-access.md#adding-other-heaters-to-apple-home).
+
+## Development checks
+
+These tests use fake HomeKit services, local HTTP servers, and mocked Bluetooth subprocesses; they do not control real AC units or require extra packages:
+
+```bash
+python3 -m unittest discover -s tests -v
+npm --prefix homebridge-daikin-web test
+```
 
 ## Security defaults
 

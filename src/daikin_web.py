@@ -6,10 +6,12 @@ A single BLE radio is shared, so all calls are serialized through one lock.
 """
 import copy
 import json
+import math
 import os
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -83,6 +85,7 @@ POST_CALL_SETTLE = float(os.environ.get("DAIKIN_POST_CALL_SETTLE", "1.0"))
 MAX_POST_BODY = int(os.environ.get("DAIKIN_MAX_POST_BODY", "4096"))
 REQUEST_TIMEOUT = float(os.environ.get("DAIKIN_REQUEST_TIMEOUT", "10"))
 REQUEST_QUEUE_SIZE = int(os.environ.get("DAIKIN_REQUEST_QUEUE_SIZE", "16"))
+WRITE_TIMEOUT = 60.0
 
 
 def classify_error(message):
@@ -120,7 +123,7 @@ def parse_setpoint(value, label):
     """Strictly parse a HomeKit/UI setpoint.
 
     JSON booleans are `int` subclasses in Python, so reject them before numeric
-    coercion. Madoka accepts integral Celsius values in the 16-30 range.
+    coercion. pymadoka's CLI silently clamps writes above 30 C.
     """
     if isinstance(value, bool):
         raise ValueError(f"{label} setpoint must be an integer between 16 and 30")
@@ -138,7 +141,7 @@ def parse_setpoint(value, label):
     else:
         raise ValueError(f"{label} setpoint must be an integer between 16 and 30")
     if parsed < 16 or parsed > 30:
-        raise ValueError(f"{label} setpoint must be between 16 and 30")
+        raise ValueError(f"{label} setpoint must be between 16 and 30; pymadoka cannot preserve values outside this range")
     return parsed
 
 HTML = r"""<!doctype html>
@@ -517,7 +520,10 @@ HTML = r"""<!doctype html>
             : (data.error || res.statusText);
           throw new Error(friendly);
         }
-        if (data.status) render(data.status);
+        if (data.status) {
+          render(data.status);
+          if (data.verified === false) els.status.textContent = 'Unverified state. Refresh to read the controller.';
+        }
         else await refresh();
       } catch (err) {
         if (room === currentRoom) els.status.textContent = err.message || 'Request failed';
@@ -569,7 +575,27 @@ HTML = r"""<!doctype html>
 """
 
 
-def run_pymadoka(mac, *args):
+def remaining_time(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise DeviceError("expired", "command expired; send a new command if still wanted")
+    return remaining
+
+
+@contextmanager
+def locked(lock, deadline=None):
+    acquired = lock.acquire() if deadline is None else lock.acquire(timeout=remaining_time(deadline))
+    if not acquired:
+        raise DeviceError("expired", "command expired while waiting for Bluetooth")
+    try:
+        if deadline is not None:
+            remaining_time(deadline)
+        yield
+    finally:
+        lock.release()
+
+
+def run_pymadoka(mac, *args, deadline=None):
     """Run the pymadoka CLI under the global BLE lock.
 
     Retries up to PYMADOKA_RETRIES extra times on transient BLE errors before
@@ -578,21 +604,25 @@ def run_pymadoka(mac, *args):
     """
     cmd = [PYMADOKA, "-a", mac, "-d", ADAPTER, "--clean", *args]
     last_error = None
-    attempts = PYMADOKA_RETRIES + 1
-    with BLE_LOCK:
+    # A timed-out write may already have reached the controller. Never replay it.
+    attempts = PYMADOKA_RETRIES + 1 if args[:1] == ("get-status",) else 1
+    with locked(BLE_LOCK, deadline):
         _stop_ble_discovery()
         try:
             for attempt in range(attempts):
                 try:
+                    timeout = PYMADOKA_TIMEOUT
+                    if deadline is not None:
+                        timeout = min(timeout, remaining_time(deadline))
                     proc = subprocess.run(
-                        cmd, text=True, capture_output=True, timeout=PYMADOKA_TIMEOUT,
+                        cmd, text=True, capture_output=True, timeout=timeout,
                     )
                     if proc.returncode == 0:
                         last_error = None
                         output = proc.stdout.strip()
                         if args[:1] == ("get-status",):
                             if not output:
-                                last_error = RuntimeError("pymadoka get-status returned empty output")
+                                last_error = RuntimeError(f"pymadoka get-status returned empty output: {proc.stderr.strip()}")
                                 raise last_error
                             try:
                                 data = json.loads(output)
@@ -601,22 +631,42 @@ def run_pymadoka(mac, *args):
                                     f"pymadoka get-status returned non-JSON output: {exc}"
                                 )
                                 raise last_error
-                            expected = {
-                                "power_state", "operation_mode", "set_point",
-                                "fan_speed", "temperatures", "clean_filter_indicator",
-                            }
-                            if not isinstance(data, dict) or not (expected & set(data.keys())):
+                            if (not isinstance(data, dict)
+                                    or not isinstance(data.get("power_state"), dict)
+                                    or type(data["power_state"].get("turn_on")) is not bool
+                                    or not isinstance(data.get("operation_mode"), dict)
+                                    or not isinstance(data["operation_mode"].get("operation_mode"), str)
+                                    or not isinstance(data.get("set_point"), dict)
+                                    or any(type(data["set_point"].get(key)) not in (int, float)
+                                           or not math.isfinite(data["set_point"][key])
+                                           for key in ("cooling_set_point", "heating_set_point"))):
                                 last_error = RuntimeError(
-                                    "pymadoka get-status returned JSON without expected status fields"
+                                    "pymadoka get-status returned incomplete status"
                                 )
                                 raise last_error
                             return data
+                        # The CLI catches some exceptions and still exits 0.
+                        # Only a structured acknowledgement is a successful write.
                         if not output:
-                            return {}
+                            raise RuntimeError(f"pymadoka {args[0]} returned no acknowledgement: {proc.stderr.strip()}")
                         try:
-                            return json.loads(output)
-                        except json.JSONDecodeError:
-                            return {"output": output}
+                            data = json.loads(output)
+                        except json.JSONDecodeError as exc:
+                            raise RuntimeError(f"pymadoka {args[0]} returned non-JSON output") from exc
+                        expected = {}
+                        if args[0] == "set-power-state":
+                            expected = {"turn_on": args[1] == "ON"}
+                        elif args[0] == "set-operation-mode":
+                            expected = {"operation_mode": args[1]}
+                        elif args[0] == "set-fan-speed":
+                            expected = {"cooling_fan_speed": args[1], "heating_fan_speed": args[2]}
+                        elif args[0] == "set-set-point":
+                            expected = {"cooling_set_point": int(args[1]), "heating_set_point": int(args[2])}
+                        if not isinstance(data, dict) or not expected or any(
+                                type(data.get(key)) is not type(value) or data[key] != value
+                                for key, value in expected.items()):
+                            raise RuntimeError(f"pymadoka {args[0]} returned an invalid acknowledgement")
+                        return data
                     detail = (proc.stderr or proc.stdout or "").strip()
                     last_error = RuntimeError(
                         detail or f"pymadoka exited with {proc.returncode}"
@@ -625,6 +675,10 @@ def run_pymadoka(mac, *args):
                     # Python 3.3+ kills + waits the child before raising, so no
                     # zombie risk. We just record and (maybe) retry.
                     last_error = RuntimeError(f"pymadoka timed out after {exc.timeout}s")
+                except DeviceError:
+                    raise
+                except RuntimeError as exc:
+                    last_error = exc
                 if attempt + 1 >= attempts or not _is_retryable(str(last_error)):
                     raise last_error
                 time.sleep(PYMADOKA_RETRY_BACKOFF)
@@ -708,7 +762,7 @@ def _device_lock(device):
     with _DEVICE_LOCKS_GUARD:
         lock = _DEVICE_LOCKS.get(device["id"])
         if lock is None:
-            lock = threading.Lock()
+            lock = threading.RLock()
             _DEVICE_LOCKS[device["id"]] = lock
     return lock
 
@@ -764,7 +818,14 @@ def invalidate(device):
         STATUS_CACHE.pop(device["id"], None)
 
 
-def get_status_full(device, force=False, bypass_cooldown=False, allow_stale_on_error=False):
+def get_status_full(device, force=False, bypass_cooldown=False, deadline=None):
+    # Reads must share the write lock: an older read must not overwrite a newer
+    # write's cache patch after releasing the global BLE lock.
+    with locked(_device_lock(device), deadline):
+        return _get_status_full(device, force, bypass_cooldown, deadline)
+
+
+def _get_status_full(device, force, bypass_cooldown, deadline):
     """Return (data, verified) where verified is True iff the data came from
     a real BLE read (vs a post-write synthesized cache entry)."""
     if not force:
@@ -772,22 +833,14 @@ def get_status_full(device, force=False, bypass_cooldown=False, allow_stale_on_e
         if entry is not None:
             return entry
     if not bypass_cooldown:
-        try:
-            check_cooldown(device)
-        except DeviceError:
-            if allow_stale_on_error:
-                stale = _cache_get_any(device)
-                if stale is not None:
-                    return stale
-            raise
+        check_cooldown(device)
     try:
-        data = run_pymadoka(device["mac"], "get-status")
+        data = run_pymadoka(device["mac"], "get-status", deadline=deadline)
+    except DeviceError:
+        raise
     except Exception as exc:
         err = record_failure(device, exc)
-        if allow_stale_on_error:
-            stale = _cache_get_any(device)
-            if stale is not None:
-                return stale
+        print(f'[{device["id"]}] status failed ({err.code}): {err}', flush=True)
         raise err
     clear_failure(device)
     _cache_set(device, data, verified=True)
@@ -798,14 +851,16 @@ def get_status(device, force=False):
     return get_status_full(device, force=force)[0]
 
 
-def ble_write(device, *args, bypass_cooldown=False):
+def ble_write(device, *args, bypass_cooldown=False, deadline=None):
     """Perform a single Madoka write. The caller is responsible for updating
     the cache afterwards (see handle_action) so we don't pay a second BLE
     round-trip just to read back what we just wrote."""
     if not bypass_cooldown:
         check_cooldown(device)
     try:
-        run_pymadoka(device["mac"], *args)
+        run_pymadoka(device["mac"], *args, deadline=deadline)
+    except DeviceError:
+        raise
     except Exception as exc:
         invalidate(device)
         raise record_failure(device, exc)
@@ -821,7 +876,7 @@ def resolve_device(room_id):
     return dev
 
 
-def handle_action(device, payload):
+def handle_action(device, payload, deadline=None):
     """Apply a single Madoka write and return the synthesized post-write state.
 
     Previously this did a forced get-status BEFORE and AFTER each write — three
@@ -834,16 +889,22 @@ def handle_action(device, payload):
     writes to the same room can't land their cache patches out of order.
     """
     action = payload.get("action")
-    with _device_lock(device):
+    if deadline is None:
+        deadline = time.monotonic() + WRITE_TIMEOUT
+    with locked(_device_lock(device), deadline):
         # Never do a fresh BLE pre-read for simple user writes. If cache is
         # stale/missing, write anyway and use the cache only as a merge base.
-        status, verified = _status_for_write(device)
+        status, _ = _status_for_write(device)
 
         def commit(write_args, patch):
-            """Run the BLE write, then merge our delta on top of the latest
-            cache (which may have been refreshed by a parallel thread during
-            our BLE call)."""
-            ble_write(device, *write_args, bypass_cooldown=True)
+            """Run the BLE write, then patch the room's serialized cache."""
+            print(f'[{device["id"]}] command start: {" ".join(write_args)}', flush=True)
+            try:
+                ble_write(device, *write_args, bypass_cooldown=True, deadline=deadline)
+            except DeviceError as exc:
+                print(f'[{device["id"]}] command failed ({exc.code}): {exc}', flush=True)
+                raise
+            print(f'[{device["id"]}] command completed: {" ".join(write_args)}', flush=True)
             with STATE_LOCK:
                 cached = STATUS_CACHE.get(device["id"])
                 base = copy.deepcopy(cached["data"]) if cached else copy.deepcopy(status)
@@ -858,11 +919,8 @@ def handle_action(device, payload):
             value = payload.get("state")
             if value not in {"ON", "OFF"}:
                 raise ValueError("state must be ON or OFF")
-            current = "ON" if status.get("power_state", {}).get("turn_on") else "OFF"
-            # Only short-circuit when we have ground truth — otherwise a stale
-            # synthesized cache could make us skip a write the AC actually needs.
-            if verified and value == current:
-                return status
+            # Even a recent read can predate a physical-remote change. In
+            # particular, never skip an explicit OFF based on cached state.
 
             def patch(s):
                 s.setdefault("power_state", {})["turn_on"] = (value == "ON")
@@ -872,10 +930,6 @@ def handle_action(device, payload):
             value = payload.get("mode")
             if value not in {"FAN", "DRY", "AUTO", "COOL", "HEAT", "VENTILATION"}:
                 raise ValueError("invalid mode")
-            current = status.get("operation_mode", {}).get("operation_mode")
-            if verified and value == current:
-                return status
-
             def patch(s):
                 s.setdefault("operation_mode", {})["operation_mode"] = value
             return commit(("set-operation-mode", value), patch)
@@ -884,12 +938,6 @@ def handle_action(device, payload):
             value = payload.get("speed")
             if value not in {"LOW", "MID", "HIGH", "AUTO"}:
                 raise ValueError("invalid fan speed")
-            fan = status.get("fan_speed", {})
-            if (verified
-                    and fan.get("cooling_fan_speed") == value
-                    and fan.get("heating_fan_speed") == value):
-                return status
-
             def patch(s):
                 f = s.setdefault("fan_speed", {})
                 f["cooling_fan_speed"] = value
@@ -898,63 +946,31 @@ def handle_action(device, payload):
 
         if action == "setpoint":
             # pymadoka's set-set-point takes BOTH cooling and heating, so a
-            # partial update needs accurate cached values for the side we're
-            # NOT changing — otherwise we'd clobber it with a default. If the
-            # client supplies both sides (HomeBridge now does), avoid the fresh
-            # BLE pre-read entirely.
-            set_point = status.get("set_point", {})
-            cached_cooling = set_point.get("cooling_set_point")
-            cached_heating = set_point.get("heating_set_point")
-            cooling = (
-                parse_setpoint(cached_cooling, "cached cooling")
-                if cached_cooling is not None else None
-            )
-            heating = (
-                parse_setpoint(cached_heating, "cached heating")
-                if cached_heating is not None else None
-            )
-            original = (cooling, heating)
-            # Explicit per-side overrides (used by HomeKit HeaterCooler which has
-            # separate cooling/heating thresholds).
-            if "cooling" in payload and payload["cooling"] is not None:
-                cooling = parse_setpoint(payload["cooling"], "cooling")
-            if "heating" in payload and payload["heating"] is not None:
-                heating = parse_setpoint(payload["heating"], "heating")
-            # Legacy single-value path (the touch web UI): pick the side based on
-            # the current Madoka operation mode.
-            if "value" in payload and payload["value"] is not None:
-                v = parse_setpoint(payload["value"], "value")
-                mode = status.get("operation_mode", {}).get("operation_mode")
-                if mode == "HEAT":
-                    heating = v
-                else:
-                    cooling = v
-            if cooling is None or heating is None:
-                status, verified = get_status_full(
+            # partial update needs a live value for the side not being changed.
+            # Supplying both sides avoids that extra round-trip.
+            overrides = {}
+            for side in ("cooling", "heating", "value"):
+                if payload.get(side) is not None:
+                    overrides[side] = parse_setpoint(payload[side], side)
+            if not overrides:
+                raise ValueError("a cooling, heating, or value setpoint is required")
+            if "value" in overrides and len(overrides) != 1:
+                raise ValueError("value cannot be combined with cooling or heating")
+            # Partial writes preserve the other threshold from a live read,
+            # never from an old or optimistically patched cache.
+            if "value" in overrides or len(overrides) < 2:
+                status, _ = get_status_full(
                     device,
                     force=True,
                     bypass_cooldown=True,
-                    allow_stale_on_error=True,
+                    deadline=deadline,
                 )
-                set_point = status.get("set_point", {})
-                if cooling is None:
-                    cached_cooling = set_point.get("cooling_set_point")
-                    if cached_cooling is not None:
-                        cooling = parse_setpoint(cached_cooling, "cached cooling")
-                if heating is None:
-                    cached_heating = set_point.get("heating_set_point")
-                    if cached_heating is not None:
-                        heating = parse_setpoint(cached_heating, "cached heating")
-                original = (
-                    parse_setpoint(set_point.get("cooling_set_point"), "cached cooling")
-                    if set_point.get("cooling_set_point") is not None else None,
-                    parse_setpoint(set_point.get("heating_set_point"), "cached heating")
-                    if set_point.get("heating_set_point") is not None else None,
-                )
-            if cooling is None or heating is None:
-                raise ValueError("both cooling and heating setpoints are required until a live status read succeeds")
-            if verified and (cooling, heating) == original:
-                return status
+            if "value" in overrides:
+                side = "heating" if status["operation_mode"]["operation_mode"] == "HEAT" else "cooling"
+                overrides[side] = overrides.pop("value")
+            set_point = status.get("set_point", {})
+            cooling = parse_setpoint(overrides.get("cooling", set_point.get("cooling_set_point")), "cooling")
+            heating = parse_setpoint(overrides.get("heating", set_point.get("heating_set_point")), "heating")
 
             new_cooling, new_heating = cooling, heating
 
@@ -1031,7 +1047,19 @@ class Handler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError):
                     pass
             elif path == "/healthz":
-                self.send_json({"ok": True, "rooms": len(DEVICES)})
+                with STATE_LOCK:
+                    diagnostics = {}
+                    for device in DEVICES:
+                        cached = STATUS_CACHE.get(device["id"])
+                        failure = FAILURES.get(device["id"])
+                        age = max(0, time.time() - cached["ts"]) if cached else None
+                        diagnostics[device["id"]] = {
+                            "age_seconds": age,
+                            "verified": bool(cached and cached.get("verified", True)
+                                             and age < STATUS_TTL and not failure),
+                            "last_error": failure["code"] if failure else None,
+                        }
+                self.send_json({"ok": True, "rooms": len(DEVICES), "devices": diagnostics})
             elif path == "/api/devices":
                 self.send_json({"ok": True, "devices": [
                     {"id": d["id"], "name": d["name"], "mac": d["mac"]} for d in DEVICES
@@ -1039,15 +1067,13 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/status":
                 device = self._room(query)
                 force = (query.get("force") or ["0"])[0] in {"1", "true", "yes"}
-                status, verified = get_status_full(
-                    device,
-                    force=force,
-                    bypass_cooldown=force,
-                    allow_stale_on_error=True,
-                )
-                payload = {"ok": True, "room": device["id"], "status": status}
-                if not verified:
-                    payload["verified"] = False
+                with _device_lock(device):
+                    status, verified = get_status_full(device, force=force, bypass_cooldown=force)
+                    with STATE_LOCK:
+                        cached = STATUS_CACHE.get(device["id"])
+                        age = max(0, time.time() - cached["ts"]) if cached else 0
+                payload = {"ok": True, "room": device["id"], "status": status,
+                           "verified": verified, "age_seconds": age}
                 self.send_json(payload)
             else:
                 self.send_error(404)
@@ -1061,6 +1087,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            deadline = time.monotonic() + WRITE_TIMEOUT
+            expires = self.headers.get("X-Daikin-Expires-At")
+            if expires is not None:
+                expires = float(expires)
+                if not math.isfinite(expires):
+                    raise ValueError("invalid command expiry")
+                deadline = min(deadline, time.monotonic() + expires / 1000 - time.time())
+            remaining_time(deadline)
             path, query = self._parsed()
             try:
                 length = int(self.headers.get("content-length", "0") or "0")
@@ -1097,7 +1131,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             device = self._room(query, payload)
             payload["action"] = action
-            self.send_json({"ok": True, "room": device["id"], "status": handle_action(device, payload)})
+            self.send_json({"ok": True, "room": device["id"],
+                            "status": handle_action(device, payload, deadline),
+                            "verified": False})
         except DeviceError as exc:
             self.send_json({"ok": False, "code": exc.code, "error": exc.message}, 503)
         except (ValueError, KeyError) as exc:

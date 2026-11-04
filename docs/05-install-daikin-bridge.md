@@ -86,3 +86,29 @@ In the Home app:
 2. Add Accessory.
 3. Scan the HomeBridge QR code or enter the HomeBridge PIN from the UI.
 4. Assign each AC to the right room.
+
+## Updating an existing installation
+
+Back up the installed backend, plugin files, and local configuration first.
+Check the actual backend location with:
+
+```bash
+systemctl show --no-pager daikin-web -p ExecStart -p EnvironmentFiles
+```
+
+Early installations may run from a user's home directory rather than
+`/opt/daikin-web`. Do not replace such an installation blindly: move any
+hard-coded device list into `DAIKIN_DEVICES` in the service's environment file
+first. Keep the existing room IDs, MACs, service user, virtual environment path,
+and Homebridge configuration. Never replace them with the example devices.
+
+Update the backend and both plugin files together, then restart `daikin-web`
+and `homebridge` during a maintenance window. Restarting discards unsent
+commands; it does not intentionally turn any units on or off. Do not remove
+the Homebridge bridge from Apple Home or clear its accessory cache.
+
+Version 0.2 changes error reporting and reports the real indoor sensor instead
+of mirroring a setpoint. Review any temperature-based Home automations before
+deploying. Use the read-only checks in [troubleshooting](08-troubleshooting.md)
+first; test a physical power or temperature change only when someone is ready
+to observe the intended result.

@@ -1,8 +1,11 @@
 {
   "name": "homebridge-daikin-web",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "HomeBridge platform plugin for a local Daikin Madoka Bluetooth bridge.",
   "main": "index.js",
+  "scripts": {
+    "test": "node --test"
+  },
   "keywords": [
     "homebridge-plugin",
     "daikin",
@@ -17,4 +20,3 @@
   },
   "license": "MIT"
 }
-

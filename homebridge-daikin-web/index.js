@@ -1,9 +1,12 @@
 "use strict";
 
 const http = require("http");
+const { version } = require("./package.json");
 
 const PLUGIN_NAME = "homebridge-daikin-web";
 const PLATFORM_NAME = "DaikinWeb";
+const WRITE_TIMEOUT_MS = 60_000;
+const MAX_STATE_AGE_MS = 5 * 60_000;
 
 module.exports = (api) => {
   api.registerPlatform(PLUGIN_NAME, PLATFORM_NAME, DaikinWebPlatform);
@@ -31,6 +34,9 @@ class DaikinWebPlatform {
       this.log.info(`Daikin Web platform booted, base URL = ${this.baseUrl}, devices = ${this.devices.length}`);
       this.discoverDevices();
     });
+    this.api.on("shutdown", () => {
+      for (const accessory of this.accessories.values()) accessory._daikinInstance?.cleanup();
+    });
   }
 
   hasQueuedWrite() {
@@ -56,6 +62,9 @@ class DaikinWebPlatform {
 
     if (kind === "poll" && this.queue.length >= this.maxQueueDepth) {
       return Promise.resolve(opts.skipValue ? opts.skipValue() : undefined);
+    }
+    if (this.queue.length >= this.maxQueueDepth) {
+      return Promise.reject(new Error("command queue is full; send a new command later"));
     }
 
     let resolve;
@@ -167,6 +176,7 @@ class DaikinAccessory {
     this.state = null;
     this.lastFetch = 0;
     this.fetching = null;
+    this.fault = null;
     // Set by cleanup() so the poll timer's tail tick + the write pump both
     // stop scheduling more work after the accessory is removed.
     this.destroyed = false;
@@ -181,13 +191,14 @@ class DaikinAccessory {
     // can drain it. We keep only the LATEST pending body per endpoint and
     // a single pump task drains them one at a time.
     this.pendingWrites = new Map();
+    this.desiredWrites = new Map();
     this.writerActive = false;
 
     accessory.getService(Service.AccessoryInformation)
       .setCharacteristic(Characteristic.Manufacturer, "Daikin")
       .setCharacteristic(Characteristic.Model, "Madoka BRC1H (via daikin-web)")
       .setCharacteristic(Characteristic.SerialNumber, this.device.mac || this.device.id)
-      .setCharacteristic(Characteristic.FirmwareRevision, "0.1.0");
+      .setCharacteristic(Characteristic.FirmwareRevision, version);
 
     this.service =
       accessory.getService(Service.HeaterCooler) ||
@@ -202,17 +213,15 @@ class DaikinAccessory {
 
     // Active
     this.service.getCharacteristic(Characteristic.Active)
-      .onGet(() => this.activeFromState(this.state))
+      .onGet(() => this.activeFromState(this.readState()))
       .onSet((value) => {
         const on = value === Characteristic.Active.ACTIVE;
-        this.writeAsync("/api/power", { state: on ? "ON" : "OFF" }, (s) => {
-          s.power_state = { ...(s.power_state || {}), turn_on: on };
-        });
+        this.writeAsync("/api/power", { state: on ? "ON" : "OFF" });
       });
 
     // CurrentHeaterCoolerState
     this.service.getCharacteristic(Characteristic.CurrentHeaterCoolerState)
-      .onGet(() => this.currentStateFromState(this.state));
+      .onGet(() => this.currentStateFromState(this.readState()));
 
     // TargetHeaterCoolerState — AUTO / HEAT / COOL (HomeKit doesn't model FAN/DRY)
     this.service.getCharacteristic(Characteristic.TargetHeaterCoolerState)
@@ -223,54 +232,39 @@ class DaikinAccessory {
           Characteristic.TargetHeaterCoolerState.COOL,
         ],
       })
-      .onGet(() => this.targetStateFromState(this.state))
+      .onGet(() => this.targetStateFromState(this.readState()))
       .onSet((value) => {
         let mode = "AUTO";
         if (value === Characteristic.TargetHeaterCoolerState.HEAT) mode = "HEAT";
         else if (value === Characteristic.TargetHeaterCoolerState.COOL) mode = "COOL";
-        this.writeAsync("/api/mode", { mode }, (s) => {
-          s.operation_mode = { ...(s.operation_mode || {}), operation_mode: mode };
-        });
+        this.writeAsync("/api/mode", { mode });
       });
 
-    // CurrentTemperature — HomeKit's HeaterCooler service requires this
-    // characteristic, but the Madoka's "indoor" reading is taken at the AC
-    // return-air vent and reads cold (often ~5°C off). To avoid showing a
-    // misleading "currently NN°" on the Home tile, we mirror the active
-    // setpoint instead so the displayed value always matches what the user set.
+    // Report the real sensor, not the target: HomeKit automations consume this.
     this.service.getCharacteristic(Characteristic.CurrentTemperature)
       .setProps({ minValue: -50, maxValue: 100, minStep: 0.1 })
       .updateValue(20)
-      .onGet(() => this.displayTempFromState(this.state));
+      .onGet(() => this.displayTempFromState(this.readState()));
 
-    // CoolingThresholdTemperature
+    // Display physical-controller values up to 32 C, but reject writes above
+    // the CLI's 30 C cap instead of silently clamping them.
     this.service.getCharacteristic(Characteristic.CoolingThresholdTemperature)
-      .setProps({ minValue: 16, maxValue: 30, minStep: 1 })
+      .setProps({ minValue: 16, maxValue: 32, minStep: 1 })
       .updateValue(24)
-      .onGet(() => this.state?.set_point?.cooling_set_point ?? 24)
+      .onGet(() => this.readState().set_point?.cooling_set_point ?? 24)
       .onSet((value) => {
         const v = Math.round(value);
-        const body = { cooling: v };
-        const heating = this.state?.set_point?.heating_set_point;
-        if (heating !== undefined && heating !== null) body.heating = heating;
-        this.writeAsync("/api/setpoint", body, (s) => {
-          s.set_point = { ...(s.set_point || {}), cooling_set_point: v };
-        });
+        this.writeAsync("/api/setpoint", { cooling: v });
       });
 
     // HeatingThresholdTemperature
     this.service.getCharacteristic(Characteristic.HeatingThresholdTemperature)
-      .setProps({ minValue: 16, maxValue: 30, minStep: 1 })
+      .setProps({ minValue: 16, maxValue: 31, minStep: 1 })
       .updateValue(20)
-      .onGet(() => this.state?.set_point?.heating_set_point ?? 20)
+      .onGet(() => this.readState().set_point?.heating_set_point ?? 20)
       .onSet((value) => {
         const v = Math.round(value);
-        const body = { heating: v };
-        const cooling = this.state?.set_point?.cooling_set_point;
-        if (cooling !== undefined && cooling !== null) body.cooling = cooling;
-        this.writeAsync("/api/setpoint", body, (s) => {
-          s.set_point = { ...(s.set_point || {}), heating_set_point: v };
-        });
+        this.writeAsync("/api/setpoint", { heating: v });
       });
 
     this.service.getCharacteristic(Characteristic.TemperatureDisplayUnits)
@@ -285,7 +279,8 @@ class DaikinAccessory {
       .setProps({ minValue: 25, maxValue: 100, minStep: 25 })
       .updateValue(100)
       .onGet(() => {
-        const fan = this.state?.fan_speed?.cooling_fan_speed || this.state?.fan_speed?.heating_fan_speed;
+        const s = this.readState();
+        const fan = s.fan_speed?.cooling_fan_speed || s.fan_speed?.heating_fan_speed;
         return ({ LOW: 25, MID: 50, HIGH: 75, AUTO: 100 })[fan] ?? 100;
       })
       .onSet((value) => {
@@ -293,9 +288,7 @@ class DaikinAccessory {
         if (value <= 25) speed = "LOW";
         else if (value <= 50) speed = "MID";
         else if (value <= 75) speed = "HIGH";
-        this.writeAsync("/api/fan", { speed }, (s) => {
-          s.fan_speed = { ...(s.fan_speed || {}), cooling_fan_speed: speed, heating_fan_speed: speed };
-        });
+        this.writeAsync("/api/fan", { speed });
       });
 
     // Proactive polling so physical-remote / web-UI changes propagate to Home.
@@ -329,6 +322,37 @@ class DaikinAccessory {
       this.pollTimer = null;
     }
     this.pendingWrites.clear();
+    this.desiredWrites.clear();
+    clearTimeout(this.writerTimer);
+    clearTimeout(this.staleTimer);
+  }
+
+  communicationError() {
+    return new this.HAP.HapStatusError(this.HAP.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+  }
+
+  readState() {
+    if (!this.state || this.fault || Date.now() - this.lastFetch >= MAX_STATE_AGE_MS) {
+      throw this.communicationError();
+    }
+    let s = mergeStatus({}, this.state);
+    for (const [path, { body }] of this.desiredWrites) {
+      if (path === "/api/power") s = mergeStatus(s, { power_state: { turn_on: body.state === "ON" } });
+      if (path === "/api/mode") s = mergeStatus(s, { operation_mode: { operation_mode: body.mode } });
+      if (path === "/api/fan") s = mergeStatus(s, { fan_speed: { cooling_fan_speed: body.speed, heating_fan_speed: body.speed } });
+      if (path === "/api/setpoint") {
+        if (body.cooling !== undefined) s = mergeStatus(s, { set_point: { cooling_set_point: body.cooling } });
+        if (body.heating !== undefined) s = mergeStatus(s, { set_point: { heating_set_point: body.heating } });
+      }
+    }
+    return s;
+  }
+
+  scheduleExpiry() {
+    clearTimeout(this.staleTimer);
+    this.staleTimer = setTimeout(() => {
+      if (!this.destroyed) this.pushAll();
+    }, Math.max(0, this.lastFetch + MAX_STATE_AGE_MS - Date.now()));
   }
 
   activeFromState(s) {
@@ -353,18 +377,10 @@ class DaikinAccessory {
     return Characteristic.TargetHeaterCoolerState.AUTO;
   }
 
-  // What to report as "current temperature" in the Home app. We intentionally
-  // do NOT use the Madoka's indoor reading because it's a return-air sensor
-  // and routinely reads several degrees off. Instead, mirror the active
-  // setpoint so the Home tile displays a single consistent number.
   displayTempFromState(s) {
-    const mode = s?.operation_mode?.operation_mode;
-    const cooling = s?.set_point?.cooling_set_point;
-    const heating = s?.set_point?.heating_set_point;
-    if (mode === "HEAT" && typeof heating === "number") return heating;
-    if (typeof cooling === "number") return cooling;
-    if (typeof heating === "number") return heating;
-    return 20;
+    const indoor = s?.temperatures?.indoor;
+    if (!Number.isFinite(indoor) || indoor < -50 || indoor > 100) throw this.communicationError();
+    return indoor;
   }
 
   async fetchStatus(force = false) {
@@ -374,27 +390,31 @@ class DaikinAccessory {
     const fetchPromise = this.platform.enqueue(this.device.id, async () => {
       if (this.destroyed) return this.state;
       const url = `${this.platform.baseUrl}/api/status?room=${encodeURIComponent(this.device.id)}${force ? "&force=1" : ""}`;
-      const { status: httpStatus, body: data } = await httpJSON("GET", url);
-      if (this.destroyed) return this.state;
-      if (httpStatus >= 400 || data.ok === false) {
-        // Count ALL backend failures (unreachable / timeout / error) as
-        // signals to back off — for an unpaired Madoka the backend will
-        // alternate between "unreachable" and "timeout" depending on what
-        // pymadoka did before giving up, but both mean "stop hammering".
-        this.consecutiveUnreachable += 1;
-        const code = (data && data.code) || `http${httpStatus}`;
-        if (this.consecutiveUnreachable <= 2 || this.consecutiveUnreachable % 10 === 0) {
-          this.log.warn(`[${this.device.id}] status ${code} (#${this.consecutiveUnreachable}): ${(data && data.error) || "unknown"}`);
+      try {
+        const { status: httpStatus, body: data } = await httpJSON("GET", url);
+        if (this.destroyed) return this.state;
+        if (httpStatus >= 400 || data.ok !== true || data.verified === false ||
+            typeof data.status?.power_state?.turn_on !== "boolean" ||
+            typeof data.status?.operation_mode?.operation_mode !== "string" ||
+            !Number.isFinite(data.status?.set_point?.cooling_set_point) ||
+            !Number.isFinite(data.status?.set_point?.heating_set_point) ||
+            (data.age_seconds !== undefined && (!Number.isFinite(data.age_seconds) || data.age_seconds < 0))) {
+          throw new Error(data.error || `unverified or invalid status (HTTP ${httpStatus})`);
         }
-        // Prefer last known good state over throwing — keeps Home UI from
-        // flapping to "Not Responding" on a single bad read.
-        if (this.state) return this.state;
-        throw new Error((data && data.error) || `http ${httpStatus}`);
+        this.consecutiveUnreachable = 0;
+        this.state = data.status;
+        this.lastFetch = Date.now() - (data.age_seconds || 0) * 1000;
+        this.fault = null;
+        this.scheduleExpiry();
+        return this.state;
+      } catch (err) {
+        this.consecutiveUnreachable += 1;
+        if (this.consecutiveUnreachable <= 2 || this.consecutiveUnreachable % 10 === 0) {
+          this.log.warn(`[${this.device.id}] status failed (#${this.consecutiveUnreachable}): ${err.message}`);
+        }
+        if (!this.state || Date.now() - this.lastFetch >= MAX_STATE_AGE_MS) this.fault = err;
+        throw err;
       }
-      this.consecutiveUnreachable = 0;
-      this.state = data.status;
-      this.lastFetch = Date.now();
-      return this.state;
     }, {
       kind: "poll",
       priority: force ? 5 : 0,
@@ -413,126 +433,117 @@ class DaikinAccessory {
     return this.fetching;
   }
 
-  async post(path, body) {
+  async post(path, entry) {
     return this.platform.enqueue(this.device.id, async () => {
-      if (this.destroyed) return;
+      if (this.destroyed || this.desiredWrites.get(path) !== entry) {
+        this.log.debug(`[${this.device.id}] dropped superseded ${path}`);
+        return;
+      }
+      if (Date.now() >= entry.expiresAt) throw new Error("command expired in queue; not sent");
+      const { body } = entry;
+      this.log.info(`[${this.device.id}] write ${path} body=${JSON.stringify(body)}`);
       const url = `${this.platform.baseUrl}${path}?room=${encodeURIComponent(this.device.id)}`;
-      const { status: httpStatus, body: data } = await httpJSON("POST", url, body);
+      const { status: httpStatus, body: data } = await httpJSON("POST", url, body, {
+        "X-Daikin-Expires-At": String(entry.expiresAt),
+      });
       if (this.destroyed) return;
-      if (httpStatus >= 400 || data.ok === false) {
-        this.log.warn(`[${this.device.id}] write ${path} http=${httpStatus}: ${(data && data.error) || "unknown"}`);
+      if (httpStatus >= 400 || data.ok !== true || !data.status ||
+          typeof data.status !== "object" || Array.isArray(data.status)) {
+        this.log.warn(`[${this.device.id}] write ${path} http=${httpStatus}: ${data.error || "invalid write response"}`);
         throw new this.HAP.HapStatusError(this.HAP.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
       }
       if (data.status) {
         this.state = mergeStatus(this.state || {}, data.status);
-        this.lastFetch = Date.now();
-        this.consecutiveUnreachable = 0;
-        this.pushAll();
       }
     }, {
       kind: "write",
-      priority: 10,
+      priority: path === "/api/power" && entry.body.state === "OFF" ? 20 : 10,
     });
   }
 
-  // Optimistic write: patch the cache synchronously and push to HomeKit so
-  // the iOS Home app reflects the change immediately, then enqueue the BLE
-  // write. BLE writes take 20-40s and HAP's onSet handler timeout is ~5s —
-  // awaiting here used to cause "request timed out" errors. The pump
-  // coalesces multiple writes to the same endpoint so a fan-dial drag turns
-  // into ONE BLE op (latest value wins) instead of 6.
-  writeAsync(path, body, optimisticPatch) {
+  // Keep optimistic intent separate from confirmed state. HomeKit setters
+  // cannot wait for BLE; a short debounce coalesces a single Home gesture.
+  writeAsync(path, body) {
     if (this.destroyed) return;
-    try {
-      this.state = this.state || {};
-      optimisticPatch(this.state);
-      this.pushAll();
-    } catch (e) {
-      this.log.warn(`[${this.device.id}] optimistic patch failed: ${e.message || e}`);
+    if (path === "/api/setpoint" && Object.values(body).some((value) =>
+      !Number.isInteger(value) || value < 16 || value > 30)) {
+      this.log.warn(`[${this.device.id}] rejected setpoint: pymadoka supports writes from 16 to 30 C`);
+      throw new this.HAP.HapStatusError(this.HAP.HAPStatus.INVALID_VALUE_IN_REQUEST);
     }
-    const had = this.pendingWrites.has(path);
-    if (had && path === "/api/setpoint") {
-      // Merge cooling+heating writes — they go to the same backend endpoint
-      // but HomeKit fires them as separate characteristic writes. A naive
-      // replace would silently drop one side. Backend's set-set-point
-      // command always needs both values, so merging preserves both.
-      this.pendingWrites.set(path, { ...this.pendingWrites.get(path), ...body });
-    } else {
-      this.pendingWrites.set(path, body);
+    this.log.info(`[${this.device.id}] HomeKit request ${path} body=${JSON.stringify(body)}`);
+    const previous = this.desiredWrites.get(path);
+    let expiresAt = Date.now() + WRITE_TIMEOUT_MS;
+    if (previous && path === "/api/setpoint" && previous.expiresAt > Date.now()) {
+      body = { ...previous.body, ...body };
+      expiresAt = previous.expiresAt;
     }
-    if (had) {
-      this.log.debug(`[${this.device.id}] coalesced ${path} -> ${JSON.stringify(this.pendingWrites.get(path))}`);
-    }
+    const entry = { body, expiresAt };
+    this.desiredWrites.set(path, entry);
+    this.pendingWrites.set(path, entry);
+    this.pushAll();
     if (!this.writerActive) {
       this.writerActive = true;
-      this.runWriter().catch((e) => {
-        this.log.warn(`[${this.device.id}] writer pump crashed: ${e && e.message ? e.message : e}`);
-        this.writerActive = false;
-      });
+      this.writerTimer = setTimeout(() => {
+        this.runWriter().catch((e) => {
+          this.log.warn(`[${this.device.id}] writer pump crashed: ${e.message}`);
+          this.fault = e;
+          this.pushAll();
+        });
+      }, 150);
     }
   }
 
   async runWriter() {
     try {
-      while (this.pendingWrites.size > 0) {
-        // FIFO drain — process endpoints in the order they were first touched.
-        // Map preserves insertion order; updates to an existing key keep that
-        // key's position. This means the latest VALUE wins for each endpoint
-        // (good — coalesces a fan dial drag into one write) but the user's
-        // first action goes out first (good — toggling power ON before
-        // setting temp doesn't get reordered).
-        const path = this.pendingWrites.keys().next().value;
-        const body = this.pendingWrites.get(path);
+      while (!this.destroyed && this.pendingWrites.size > 0) {
+        const path = this.pendingWrites.get("/api/power")?.body.state === "OFF"
+          ? "/api/power" : this.pendingWrites.keys().next().value;
+        const entry = this.pendingWrites.get(path);
         this.pendingWrites.delete(path);
-        this.log.info(`[${this.device.id}] write ${path} body=${JSON.stringify(body)} (remaining=${this.pendingWrites.size})`);
         try {
-          await this.post(path, body);
+          await this.post(path, entry);
         } catch (err) {
-          this.log.warn(`[${this.device.id}] write ${path} failed: ${err && err.message ? err.message : err}; retrying once`);
-          try {
-            await delay(3000);
-            await this.post(path, body);
-            this.log.info(`[${this.device.id}] write ${path} succeeded on retry`);
-            continue;
-          } catch (retryErr) {
-            this.log.warn(`[${this.device.id}] write ${path} retry failed: ${retryErr && retryErr.message ? retryErr.message : retryErr}; will refresh to revert optimistic patch`);
-          }
-          // force=true bypasses the 25s status cache so we re-read the actual
-          // BLE truth instead of returning the optimistically-patched state we
-          // just wrote on the way in. Without this, the UI keeps showing the
-          // value the user tried to set even though the AC didn't accept it.
-          setTimeout(() => {
-            if (this.destroyed) return;
-            this.fetchStatus(true).then(() => this.pushAll()).catch(() => {});
-          }, 1500);
+          this.log.warn(`[${this.device.id}] write ${path} failed: ${err.message}; not replaying; checking actual state`);
+          this.fault = err;
+        } finally {
+          if (this.desiredWrites.get(path) === entry) this.desiredWrites.delete(path);
+          if (!this.destroyed) this.pushAll();
         }
       }
     } finally {
       this.writerActive = false;
+      if (!this.destroyed) await this.refresh(true);
     }
   }
 
-  async refresh() {
+  async refresh(force = false) {
     try {
-      await this.fetchStatus(false);
-      this.pushAll();
-    } catch (_) { /* logged in fetchStatus */ }
+      await this.fetchStatus(force);
+    } catch (_) { /* fetchStatus logs failures; pushAll exposes expired state. */ }
+    if (!this.destroyed) this.pushAll();
   }
 
   pushAll() {
-    const s = this.state;
-    if (!s) return;
     const { Characteristic } = this.HAP;
     const svc = this.service;
+    let s;
+    try {
+      s = this.readState();
+    } catch (err) {
+      for (const name of ["Active", "CurrentHeaterCoolerState", "TargetHeaterCoolerState",
+        "CurrentTemperature", "CoolingThresholdTemperature", "HeatingThresholdTemperature", "RotationSpeed"]) {
+        svc.getCharacteristic(Characteristic[name]).updateValue(err);
+      }
+      return;
+    }
     svc.updateCharacteristic(Characteristic.Active, this.activeFromState(s));
     svc.updateCharacteristic(Characteristic.CurrentHeaterCoolerState, this.currentStateFromState(s));
     svc.updateCharacteristic(Characteristic.TargetHeaterCoolerState, this.targetStateFromState(s));
-    if (typeof s.temperatures?.indoor === "number") {
-      // We intentionally do NOT push the real indoor reading — it's unreliable
-      // (return-air sensor). CurrentTemperature is driven by displayTempFromState
-      // below so the Home tile shows a single coherent number.
+    try {
+      svc.updateCharacteristic(Characteristic.CurrentTemperature, this.displayTempFromState(s));
+    } catch (err) {
+      svc.getCharacteristic(Characteristic.CurrentTemperature).updateValue(err);
     }
-    svc.updateCharacteristic(Characteristic.CurrentTemperature, this.displayTempFromState(s));
     if (typeof s.set_point?.cooling_set_point === "number") {
       svc.updateCharacteristic(Characteristic.CoolingThresholdTemperature, s.set_point.cooling_set_point);
     }
@@ -543,10 +554,6 @@ class DaikinAccessory {
     const fanVal = ({ LOW: 25, MID: 50, HIGH: 75, AUTO: 100 })[fan];
     if (fanVal !== undefined) svc.updateCharacteristic(Characteristic.RotationSpeed, fanVal);
   }
-}
-
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function mergeStatus(base, patch) {
@@ -562,7 +569,7 @@ function mergeStatus(base, patch) {
   return out;
 }
 
-function httpJSON(method, url, body) {
+function httpJSON(method, url, body, headers = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const data = body ? Buffer.from(JSON.stringify(body)) : null;
@@ -573,6 +580,7 @@ function httpJSON(method, url, body) {
       path: u.pathname + u.search,
       headers: {
         accept: "application/json",
+        ...headers,
         ...(data ? {
           "content-type": "application/json",
           "content-length": data.length,
@@ -583,6 +591,8 @@ function httpJSON(method, url, body) {
     const req = http.request(opts, (res) => {
       let buf = "";
       res.setEncoding("utf8");
+      res.on("error", reject);
+      res.on("aborted", () => reject(new Error("backend response aborted")));
       res.on("data", (chunk) => (buf += chunk));
       res.on("end", () => {
         let parsed = {};
@@ -592,6 +602,9 @@ function httpJSON(method, url, body) {
           } catch (err) {
             return reject(new Error(`bad json from ${url} (http ${res.statusCode}): ${err.message}`));
           }
+        }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          return reject(new Error("backend response must be a JSON object"));
         }
         resolve({ status: res.statusCode || 0, body: parsed });
       });
